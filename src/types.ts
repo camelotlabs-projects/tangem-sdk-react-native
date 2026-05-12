@@ -10,7 +10,28 @@ export enum EllipticCurve {
   Secp256k1 = "secp256k1",
   Secp256r1 = "secp256r1",
   Ed25519 = "ed25519",
+  Ed25519Slip0010 = "ed25519_slip0010",
+  Bip0340 = "bip0340",
+  Bls12381G2 = "bls12381_G2",
+  Bls12381G2Aug = "bls12381_G2_AUG",
+  Bls12381G2Pop = "bls12381_G2_POP",
 }
+
+/**
+ * Multi-curve, multi-path derivation map for `defaultDerivationPaths`.
+ * Keys are {@link EllipticCurve} raw values; values are arrays of raw derivation
+ * path strings. Enables HD-wallet auto-derivation on curves other than secp256k1.
+ *
+ * @example
+ *   // Hedera (SLIP-0010 ED25519 on BIP-44 coin-type 3030):
+ *   {
+ *     "ed25519_slip0010": [
+ *       "m/44'/3030'/0'/0'/0'",
+ *       "m/44'/3030'/0'/0'/1'"
+ *     ]
+ *   }
+ */
+export type DefaultDerivationPathsMap = Partial<Record<`${EllipticCurve}`, string[]>>;
 
 export enum LinkedTerminalStatus {
   Current = "current",
@@ -391,11 +412,32 @@ export interface OptionsStartSession extends OptionsCommon {
    */
   attestationMode?: "full" | "nomral" | "offline";
   /**
-   * A card with HD wallets feature enabled will derive keys automatically on "scan" and "createWallet". Repeated items will be ignored
-   * All derived keys will be stored in `Card.Wallet.derivedKeys`.
-   * Only `secp256k1` and `ed25519` supported
+   * On cards with the HD-wallet feature enabled, derives keys automatically during
+   * `scanCard` and `createWallet`. Repeated items are ignored. All derived keys are
+   * stored in `Card.Wallet.derivedKeys`.
+   *
+   * Three input shapes are accepted by the native bridge:
+   *
+   *   1. `string`
+   *      Single derivation path; applied to the `secp256k1` curve. This preserves
+   *      the original v3.1.0 behaviour for existing XRP-style callers.
+   *
+   *   2. `string[]`
+   *      Multiple derivation paths; all applied to the `secp256k1` curve.
+   *
+   *   3. {@link DefaultDerivationPathsMap}
+   *      Multi-curve, multi-path mapping. Required for chains that use a curve
+   *      other than `secp256k1`, e.g. Hedera (SLIP-0010 ED25519).
+   *
+   * @example
+   *   // Hedera — 16 accounts on BIP-44 coin-type 3030 (SLIP-0010 ED25519):
+   *   await RNTangemSdk.startSession({
+   *     defaultDerivationPaths: {
+   *       "ed25519_slip0010": Array.from({length: 16}, (_, i) => `m/44'/3030'/0'/0'/${i}'`)
+   *     }
+   *   });
    */
-  defaultDerivationPaths?: string;
+  defaultDerivationPaths?: string | string[] | DefaultDerivationPathsMap;
 }
 
 export type RNTangemSdkModule = {

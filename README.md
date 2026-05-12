@@ -210,7 +210,34 @@ const config = {
     attestationMode: "offline",
     defaultDerivationPaths: "m/44'/144'/0'/0/0",
 };
-RNTangemSdk.startSession();
+RNTangemSdk.startSession(config);
+```
+
+`defaultDerivationPaths` accepts three input shapes:
+
+| Shape                            | Curve applied      | Use case                                  |
+| -------------------------------- | ------------------ | ----------------------------------------- |
+| `string`                         | `secp256k1`        | Single path — XRP / BTC style (legacy)    |
+| `string[]`                       | `secp256k1`        | Multiple paths on the same curve          |
+| `{ [curve]: string[] }`          | Per-curve          | Multi-curve — e.g. ED25519 / SLIP-0010    |
+
+Example: derive 16 Hedera accounts (SLIP-0010 ED25519 on BIP-44 coin-type 3030) in a single tap:
+
+```js
+const hederaPaths = Array.from(
+    { length: 16 },
+    (_, i) => `m/44'/3030'/0'/0'/${i}'`,
+);
+
+await RNTangemSdk.startSession({
+    attestationMode: "offline",
+    defaultDerivationPaths: {
+        ed25519_slip0010: hederaPaths,
+    },
+});
+
+const card = await RNTangemSdk.scanCard();
+// card.wallets[i].derivedKeys now contains all 16 derived public keys.
 ```
 
 > It's recommended to check for NFC status before running any other method and call this method again in case of

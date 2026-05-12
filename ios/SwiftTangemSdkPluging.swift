@@ -25,9 +25,16 @@ import TangemSdk
                 if let attestationMode = optionsParser.getAttestationMode() {
                     config.attestationMode = attestationMode
                 }
-                // set default derivationPaths
-                if let defaultDerivationPath = optionsParser.getDefaultDerivationPath() {
-                    config.defaultDerivationPaths[.secp256k1] = [defaultDerivationPath]
+                // Apply default derivation paths if provided.
+                // Three input shapes are supported by getDefaultDerivationPaths():
+                //   1. String          → single path on .secp256k1 (legacy / XRP-style behaviour)
+                //   2. Array<String>   → multiple paths on .secp256k1
+                //   3. Dictionary      → multi-curve, multi-path mapping
+                //                        e.g. { "ed25519_slip0010": ["m/44'/3030'/0'/0'/0'", ...] }
+                //                        Required for chains that use non-secp256k1 derivation
+                //                        (e.g. Hedera uses SLIP-0010 ED25519).
+                if let defaultPaths = optionsParser.getDefaultDerivationPaths(), !defaultPaths.isEmpty {
+                    config.defaultDerivationPaths = defaultPaths
                 }
                 // set the new config to the SDK
                 self.sdk.config = config
@@ -364,6 +371,69 @@ class OptionsParser {
         if let defaultPath = self.options?.object(forKey: "defaultDerivationPaths") as? String {
             return try? DerivationPath(rawPath: defaultPath)
         }
+        return nil
+    }
+
+    /// Case-insensitive resolver for EllipticCurve rawValues.
+    /// Tangem's EllipticCurve enum rawValues are lowercase snake_case (e.g. "ed25519_slip0010"),
+    /// but JS callers may send uppercase or mixed case. We accept both.
+    private func resolveCurve(_ jsName: String) -> EllipticCurve? {
+        // Try direct match first (fast path for correctly-cased input)
+        if let curve = EllipticCurve(rawValue: jsName) {
+            return curve
+        }
+        // Fallback: case-insensitive scan of all enum cases
+        let lower = jsName.lowercased()
+        if let curve = EllipticCurve(rawValue: lower) {
+            return curve
+        }
+        let match = EllipticCurve.allCases.first { $0.rawValue.lowercased() == lower }
+        if match == nil {
+            NSLog("[RNTangemSdk] resolveCurve: no EllipticCurve match for JS curve name \"\(jsName)\"")
+        }
+        return match
+    }
+
+    /// Multi-curve, multi-path derivation paths.
+    /// Accepts an NSDictionary with curve-name keys mapping to arrays of raw path strings:
+    ///   { "ed25519_slip0010": ["m/44'/3030'/0'/0'/0'", ...], "secp256k1": [...] }
+    /// Also accepts a single string (legacy: maps to .secp256k1) and a single array of strings
+    /// (assumed .secp256k1 for backwards compatibility).
+    /// Unknown curve names and unparseable paths are silently skipped, never throw.
+    func getDefaultDerivationPaths() -> [EllipticCurve: [DerivationPath]]? {
+        guard let raw = self.options?.object(forKey: "defaultDerivationPaths") else {
+            return nil
+        }
+
+        // Shape 1: Dictionary { curveName: [pathString, ...] }
+        if let dict = raw as? NSDictionary {
+            var result: [EllipticCurve: [DerivationPath]] = [:]
+            for (key, value) in dict {
+                guard let curveName = key as? String,
+                      let curve = resolveCurve(curveName),
+                      let pathStrings = value as? [String] else {
+                    continue
+                }
+                let paths: [DerivationPath] = pathStrings.compactMap { try? DerivationPath(rawPath: $0) }
+                if !paths.isEmpty {
+                    result[curve] = paths
+                }
+            }
+            return result.isEmpty ? nil : result
+        }
+
+        // Shape 2: Array of path strings — assumed secp256k1 (legacy)
+        if let pathStrings = raw as? [String] {
+            let paths: [DerivationPath] = pathStrings.compactMap { try? DerivationPath(rawPath: $0) }
+            return paths.isEmpty ? nil : [.secp256k1: paths]
+        }
+
+        // Shape 3: Single path string — assumed secp256k1 (legacy v3.1.0 behaviour)
+        if let singlePath = raw as? String,
+           let derivation = try? DerivationPath(rawPath: singlePath) {
+            return [.secp256k1: [derivation]]
+        }
+
         return nil
     }
 }

@@ -173,13 +173,17 @@ class RNTangemSdkModule(private val reactContext: ReactApplicationContext) :
                     config.attestationMode = attestationMode
                 }
 
-                val defaultDerivationPath = optionsParser.getDefaultDerivationPath()
-                if (defaultDerivationPath != null) {
-                    val defaultDerivationPaths: MutableMap<EllipticCurve, List<DerivationPath>> =
-                        mutableMapOf()
-                    defaultDerivationPaths[EllipticCurve.Secp256k1] =
-                        listOf(defaultDerivationPath)
-                    config.defaultDerivationPaths = defaultDerivationPaths
+                // Apply default derivation paths if provided.
+                // Three input shapes are supported by getDefaultDerivationPaths():
+                //   1. String          → single path on Secp256k1 (legacy / XRP-style behaviour)
+                //   2. Array<String>   → multiple paths on Secp256k1
+                //   3. Map             → multi-curve, multi-path mapping
+                //                        e.g. { "ed25519_slip0010": ["m/44'/3030'/0'/0'/0'", ...] }
+                //                        Required for chains that use non-secp256k1 derivation
+                //                        (e.g. Hedera uses SLIP-0010 ED25519).
+                val multiCurvePaths = optionsParser.getDefaultDerivationPaths()
+                if (multiCurvePaths != null && multiCurvePaths.isNotEmpty()) {
+                    config.defaultDerivationPaths = multiCurvePaths.toMutableMap()
                 }
                 // set the new config to the SDK
                 sdk.config = config
@@ -581,10 +585,141 @@ class OptionsParser(private val options: ReadableMap?) {
     }
 
     fun getDefaultDerivationPath(): DerivationPath? {
+        // Legacy single-path accessor (kept for backwards compatibility with callers
+        // that only need secp256k1; the multi-curve path goes via getDefaultDerivationPaths).
         val defaultPath = options?.getString("defaultDerivationPaths")
         if (defaultPath.isNullOrEmpty()) {
             return null
         }
         return DerivationPath(rawPath = defaultPath)
+    }
+
+    /**
+     * Resolve a JS-side curve name (e.g. "ed25519_slip0010", "secp256k1") to the SDK enum.
+     *
+     * Strategy:
+     *   1. Explicit hardcoded mapping for known Tangem-Android SDK enum names (PascalCase).
+     *      This is the **primary, safest** path — reflection-free, deterministic.
+     *   2. Heuristic name-variant probing (snake_case, PascalCase, lowercase, etc.).
+     *      Fallback for SDK versions where enum names diverge from our hardcoded list.
+     *   3. Brute-force scan via `EllipticCurve.values()` matching by name/toString().
+     *
+     * Returns null if no match — caller skips that curve silently.
+     */
+    private fun resolveCurve(jsName: String): EllipticCurve? {
+        val normalized = jsName.lowercase()
+
+        // Strategy 1: explicit known mappings (deterministic, no reflection surprises).
+        // Maps JS rawValue (lowercase snake_case, matches iOS EllipticCurve.swift) to
+        // the Tangem-android Kotlin enum name (PascalCase, observed in v3.9.2 source).
+        val explicitKotlinName: String? = when (normalized) {
+            "secp256k1" -> "Secp256k1"
+            "secp256r1" -> "Secp256r1"
+            "ed25519" -> "Ed25519"
+            "ed25519_slip0010" -> "Ed25519Slip0010"
+            "bip0340" -> "Bip0340"
+            "bls12381_g2" -> "Bls12381G2"
+            "bls12381_g2_aug" -> "Bls12381G2Aug"
+            "bls12381_g2_pop" -> "Bls12381G2Pop"
+            else -> null
+        }
+        if (explicitKotlinName != null) {
+            runCatching { EllipticCurve.valueOf(explicitKotlinName) }.getOrNull()?.let { return it }
+        }
+
+        // Strategy 2: heuristic name-variant probing (covers SDK refactors where the
+        // enum naming convention diverges from our hardcoded map above).
+        val variants = mutableSetOf(
+            jsName,
+            jsName.lowercase(),
+            jsName.uppercase(),
+            // snake_case → PascalCase: "ed25519_slip0010" → "Ed25519Slip0010"
+            jsName.split('_').joinToString("") { part ->
+                part.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            },
+            // First-letter capitalised: "secp256k1" → "Secp256k1"
+            jsName.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() },
+            // Strip underscores: "ed25519_slip0010" → "Ed25519slip0010"
+            jsName.replace("_", "").replaceFirstChar {
+                if (it.isLowerCase()) it.titlecase() else it.toString()
+            }
+        )
+        for (variant in variants) {
+            runCatching { EllipticCurve.valueOf(variant) }.getOrNull()?.let { return it }
+        }
+
+        // Strategy 3: brute-force scan all entries case-insensitively.
+        val match = EllipticCurve.values().firstOrNull { entry ->
+            entry.name.equals(jsName, ignoreCase = true) ||
+                entry.toString().equals(jsName, ignoreCase = true) ||
+                entry.name.replace("_", "").equals(jsName.replace("_", ""), ignoreCase = true)
+        }
+        if (match == null) {
+            android.util.Log.w(
+                "RNTangemSdk",
+                "resolveCurve: no EllipticCurve match for JS curve name \"$jsName\""
+            )
+        }
+        return match
+    }
+
+    /**
+     * Multi-curve, multi-path derivation paths.
+     * Accepts a ReadableMap with curve-name keys mapping to ReadableArrays of raw path strings:
+     *   { "ed25519_slip0010": ["m/44'/3030'/0'/0'/0'", ...], "secp256k1": [...] }
+     * Also accepts a single string (legacy: maps to Secp256k1) and a single array of strings
+     * (assumed Secp256k1 for backwards compatibility).
+     * Unknown curve names and unparseable paths are silently skipped, never throw.
+     */
+    fun getDefaultDerivationPaths(): Map<EllipticCurve, List<DerivationPath>>? {
+        if (options == null || !options.hasKey("defaultDerivationPaths")) return null
+
+        val type = options.getType("defaultDerivationPaths")
+
+        // Shape 1: Map { curveName: [pathString, ...] }
+        if (type == ReadableType.Map) {
+            val dict = options.getMap("defaultDerivationPaths") ?: return null
+            val result = mutableMapOf<EllipticCurve, List<DerivationPath>>()
+            val iter = dict.keySetIterator()
+            while (iter.hasNextKey()) {
+                val curveName = iter.nextKey()
+                val curve = resolveCurve(curveName) ?: continue
+                if (dict.getType(curveName) != ReadableType.Array) continue
+                val arr = dict.getArray(curveName) ?: continue
+                val paths = mutableListOf<DerivationPath>()
+                for (i in 0 until arr.size()) {
+                    if (arr.getType(i) != ReadableType.String) continue
+                    val raw = arr.getString(i) ?: continue
+                    runCatching { DerivationPath(rawPath = raw) }.getOrNull()?.let { paths.add(it) }
+                }
+                if (paths.isNotEmpty()) {
+                    result[curve] = paths
+                }
+            }
+            return if (result.isEmpty()) null else result
+        }
+
+        // Shape 2: Array of path strings — assumed Secp256k1 (legacy)
+        if (type == ReadableType.Array) {
+            val arr = options.getArray("defaultDerivationPaths") ?: return null
+            val paths = mutableListOf<DerivationPath>()
+            for (i in 0 until arr.size()) {
+                if (arr.getType(i) != ReadableType.String) continue
+                val raw = arr.getString(i) ?: continue
+                runCatching { DerivationPath(rawPath = raw) }.getOrNull()?.let { paths.add(it) }
+            }
+            return if (paths.isEmpty()) null else mapOf(EllipticCurve.Secp256k1 to paths)
+        }
+
+        // Shape 3: Single path string — assumed Secp256k1 (legacy v3.1.0 behaviour)
+        if (type == ReadableType.String) {
+            val raw = options.getString("defaultDerivationPaths") ?: return null
+            if (raw.isEmpty()) return null
+            return runCatching { DerivationPath(rawPath = raw) }
+                .getOrNull()
+                ?.let { mapOf(EllipticCurve.Secp256k1 to listOf(it)) }
+        }
+
+        return null
     }
 }
