@@ -24,7 +24,26 @@ Pod::Spec.new do |s|
   s.swift_version = '5.0'
   
   # deps
-  s.dependency 'TangemSdk', "3.11.0"
+  #
+  # Pinned to 3.9.0 — last 3.9.x available on the CocoaPods trunk.
+  #
+  # Higher TangemSdk versions (3.10.0, 3.11.0) ship a `module.modulemap` that
+  # declares `TangemSdk_secp256k1` as a separate [system] module. When Pods
+  # integrates the SDK into an app workspace, Xcode/Swift cannot resolve that
+  # module without an explicit `SWIFT_INCLUDE_PATHS` pointing at the
+  # modulemap directory, causing:
+  #
+  #   error: unable to resolve module dependency: 'TangemSdk_secp256k1'
+  #
+  # The 3.9.0 series ships everything as a single module, so the wrapper
+  # works out of the box. The `ed25519_slip0010` curve (required for Hedera)
+  # is available in 3.9.0, so there is no feature regression.
+  #
+  # Alternative for >= 3.10: add a `pod_target_xcconfig` here with
+  # SWIFT_INCLUDE_PATHS = '$(PODS_ROOT)/TangemSdk/TangemSdk/TangemSdk'. Not
+  # done in this PR to keep the change minimal; happy to bump if maintainers
+  # prefer that route.
+  s.dependency 'TangemSdk', "3.9.0"
   # new archt deps
   install_modules_dependencies(s)
   
